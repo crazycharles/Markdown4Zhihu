@@ -1,53 +1,193 @@
-# GBDT+LR预测CTR经典论文阅读笔记
+# 因子分解机（FM）简介及实践
 
-本文要介绍的CTR预估方法来自Facebook发表于2014年的一篇文章（[Practical Lessons from Predicting Clicks on Ads at Facebook](https://dl.acm.org/doi/pdf/10.1145/2648584.2648589)）。这篇文章通过GBDT+LR的组合方式，相比于其中任意单一方法，带来了CTR预估性能的提升。有关LR、GBDT的介绍可以参考之前的文章（[逻辑回归简介及实现](https://zhuanlan.zhihu.com/p/130209974)、[梯度提升树（GBDT）简介](https://zhuanlan.zhihu.com/p/139381538)）。其实有关这篇经典论文的专业解读已经很多了，我作为小白把自己的阅读笔记整理在这里只是为了加深理解，如果有写的不对的地方，还请大家指出，不胜感谢！
+因子分解机（Factorization Machines, FM）是一个在2010年被提出的算法，是预估CTR的经典模型之一。在这篇文章里，前半部分会介绍FM的原理，后半部分会通过tensorflow来实现FM算法。由于个人水平十分有限，文章中对算法理解不当的地方，烦请大家指出，不胜感激！
 
-## 论文立意
+# 1 FM简介
 
-这篇文章采用了GBDT+LR的组合结构，需要说明的是这两部分模型是分开训练的，也就是先训练好GBDT为每个数据构造新的特征，然后根据新特征来训练LR的。
+## 1.1 提出的动机
 
-首先关于使用GBDT这部分，给我的感觉来说，是为了添加一部分LR考虑不到的特征，因为如果单纯使用LR模型，只会考虑到每个特征本身对结果的影响，也就是所有特征的线性加权组合，但是如果使用GBDT构造出一部分特征的规则，就会使得LR考虑到特征之间的关系，虽然论文内容里给出的是单纯使用GBDT构造的特征来进行学习，但我们同样的可以利用数据的原有特征再加上GBDT特征共同预测CTR。
+我们知道逻辑回归方法是对所有特征的一个线性加权组合，其预测值可以写为如下形式：
+$$
+\hat{y}(x):=w_{0}+\sum_{i=1}^{n}w_{i}x_{i}.\tag{1}
+$$
+但这样的形式只是单独考虑了每个特征对目标值$y$的影响，而没有考虑特征之间的关系，比如二阶组合特征$x_{i}\cdot x_{j}$或者三阶组合特征$x_{i}\cdot x_{j}\cdot x_{k}$对目标值的影响。现在我们只考虑二阶特征组合的情况，那么逻辑回归表达式可以改写为：
+$$
+\hat{y}(x):=w_{0}+\sum_{i=1}^{n}w_{i}x_{i}+\sum_{i=1}^{n}\sum_{j=i+1}^{n}w_{i,j}x_{i}x_{j}.\tag{2}
+$$
+写成公式2的形式确实是考虑了二阶特征组合对模型预测的影响，但同时会带来一个新的问题。因为在CTR预估问题里面，或者很多分类、回归问题里面，我们常常需要对类别型特征进行one-hot编码（比如男性、女性分别被编码为01,10），当类别型特征变量较多的情况下，编码后其实是会产生了高维特征，这导致我们很难找到一组$x_{i}$和$x_{j}$使得$x_{i}\cdot x_{j}$不为0。而对于大多数$x_{i}x_{j}$乘积为0的项，对应的$w_{ij}$在梯度更新时$\frac{\partial {\hat{y}(x)}}{\partial w_{i,j}}=x_{i}x_{j}=0$，也就无法进行梯度更新来求解$w_{ij}$。
 
-其次关于LR这部分，因为Facebook每天会产生特别多的新数据，GBDT是无法快速进行online learning的，因为数据量大，每次训练GBDT可能要花费几天的时间，但是LR是可以通过学习新数据来调整权重的，比如采用随机梯度下降的方法学习新的样本。所以GBDT可以采用每隔几天训练一次，但是LR采用实时更新的方式来预测CTR。
+而因子分解机的工作就是将$w_{i,j}$替换为两个向量的乘积$v_{i}v_{j}$，进而缓解了稀疏特征对模型求解的困难。
 
-## 模型结构
+## 1.2 具体内容
 
-这篇文章最大的改进点在于利用GBDT方法为每个样本构造了一系列特征，之后利用LR方法对特征加权求和，进而预估CTR。其模型结构如下图所示：
+仅考虑二阶特征组合的话，FM模型表达式可以写为：
+$$
+\hat{y}(x):=w_{0}+\sum_{i=1}^{n}w_{i}x_{i}+\sum_{i=1}^{n}\sum_{j=i+1}^{n}<\textbf{v}_{i},\textbf{v}_{j}>x_{i}x_{j}.\tag{3}
+$$
+其中$<\textbf{v}_{i},\textbf{v}_{j}>$是$k$维向量$\textbf{v}_{i}$和$\textbf{v}_{j}$的点积，也是对应一个实数值：
+$$
+<\textbf{v}_{i},\textbf{v}_{j}>:=\sum_{f=1}^{k}v_{i,f}\cdot v_{j,f}.\tag{4}
+$$
+由矩阵分解可知，对任意一个正定矩阵$\textbf{W}$，都可以找到一个矩阵$\textbf{V}$，且在矩阵$\textbf{V}$维度$k$足够大的情况下使得$\textbf{W}=\textbf{V}\cdot \textbf{V}^{t}$成立。FM这样写法的精妙之处在于，首先通过矩阵分解用两个向量$\textbf{v}_{i}$和$\textbf{v}_{j}$的乘积近似原先矩阵$\textbf{W}$，这保持了变化前后的统一。其次，在拆解为$\textbf{v}_{i}$和$\textbf{v}_{j}$之后，参数更新时是对这两个向量分别更新的，那么在更新时，对于向量$\textbf{v}_{i}$，我们不需要寻找到一组$x_{i}$和$x_{j}$同时不为0，我们只需要在$x_{i}\neq 0$的情况下，找到任意一个样本$x_{k}\neq 0$即可通过$x_{i}x_{k}$来更新$\textbf{v}_{i}$，也就是说，原先更新参数$w_{i,j}$的条件对于稀疏数据比较苛刻，FM这样的写法缓解了稀疏数据造成无法更新参数的困难。
 
-<img src="structure.png" alt="avatar" style="zoom:75%;" />
+其实我觉得FM算法的核心思想写到这里就介绍完了，因子分解机中的“因子分解”部分就是替换原先的$w_{i,j}$。而在FM论文里，作者更进一步，将公式3改写，降低FM算法的时间复杂度。对于公式3，我们知道二阶项有两次循环，而$<\textbf{v}_{i},\textbf{v}_{j}>$又是经过$k$次计算，因此其时间复杂度为$O(kn^{2})$，但通过如下的转换过程，可以将时间复杂度降低为$O(kn)$：
+$$
+\begin{align}
+\sum_{i=1}^{n}\sum_{j=i+1}^{n}<\textbf{v}_{i},\textbf{v}_{j}>x_{i}x_{j}
+&=\frac{1}{2}\left(\sum_{i=1}^{n}\sum_{j=1}^{n}<\textbf{v}_{i},\textbf{v}_{j}>x_{i}x_{j}-\sum_{i=1}^{n}<\textbf{v}_{i},\textbf{v}_{i}>x_{i}x_{i}\right)\\
+&=\frac{1}{2}\left(\sum_{i=1}^{n}\sum_{j=1}^{n}\sum_{f=1}^{k}v_{i,f}v_{j,f}x_{i}x_{j}-\sum_{i=1}^{n}\sum_{f=1}^{k}v_{i,f}v_{i,f}x_{i}x_{i}\right)\\
+&=\frac{1}{2}\sum_{f=1}^{k}\left(\left(\sum_{i=1}^{n}v_{i,f}x_{i}\right)\left(\sum_{j=1}^{n}v_{j,f}x_{j}\right)-\sum_{i=1}^{n}v_{i,f}^{2}x_{i}^{2}\right)\\
+&=\frac{1}{2}\sum_{f=1}^{k}\left(\left(\sum_{i=1}^{n}v_{i,f}x_{i}\right)^{2}-\sum_{i=1}^{n}v_{i,f}^{2}x_{i}^{2}\right).
+\end{align}\tag{5}
+$$
+需要解释一下的是公式5的第1步，原始求解的就是矩阵上三角之和，那么第1步就是整个矩阵之和减去矩阵的迹，然后求一半。对于稀疏数据中$x_{i}$大多数都为0，假设$\overline{m}_{D}$代表的是对于所有数据$\textbf{x}$特征不为0个数的平均值，那么FM算法复杂度实际上为$O(k\overline{m}_{D})$。
 
-由于数据对应的类标为$y\in\{+1,-1\}$，分别代表该广告被点击和不被点击，因此GBDT在这篇论文中采用的是二分类问题的GBDT方法，在训练好GBDT模型之后，我们需要将每个样本$x$走一遍GBDT流程。如上图所示，GBDT构造了两棵决策树，分别有3个叶结点和2个叶结点，当样本输入到第一棵决策树时，我们假设其最终走到了第2个叶结点，接着输入到第二棵决策树时，我们假设其走到了第1个叶结点。
+那么二阶FM表达式可以写为：
+$$
+\hat{y}(x):=w_{0}+\sum_{i=1}^{n}w_{i}x_{i}+\frac{1}{2}\sum_{f=1}^{k}\left(\left(\sum_{i=1}^{n}v_{i,f}x_{i}\right)^{2}-\sum_{i=1}^{n}v_{i,f}^{2}x_{i}^{2}\right).\tag{6}
+$$
 
-那么GBDT对这个样本$x$构造的新特征向量可以表示为：$\{0,1,0,1,0\}$。特征维度为5是因为GBDT共有5个叶结点，特征向量前3个值$\{0,1,0\}$代表样本在第1棵决策树上落入到了第2个叶结点，后两个值$\{1,0\}$代表样本在第2棵决策树上落入了第1个叶结点。因此我们知道，特征向量中1的个数代表了决策树的总棵数，而对于每个决策树来说，其相应的特征向量只有一个为1，其余均为0。
 
-同样的，对每个样本$x$都经过相同的流程获取新的5维特征向量，在这之后，利用转换过特征之后的样本来训练LR模型。上图中的$\{w_{0},w_{1},w_{2},w_{3},w_{4}\}$代表的是LR模型中对每个特征的权重，我们知道每个样本会从根节点出发一直走到叶结点，这样来说样本走过的每条路径代表的都是一个特征规则，所以新特征向量中的$0,1$代表的是样本是否符合对应的规则路径，而LR的权重向量就是在学习每条规则对CTR结果的影响。
+接下来我们根据公式6计算一下FM算法更新时的梯度。
 
-如下表所示，GBDT+LR的模型结构相较于单一GBDT或单一LR模型来说，其性能均有提升。表格中的评价指标NE（Normalized Entropy）可以理解为模型预测产生的损失与数据集原有损失之比，也就是说其值越小越好。相对于仅使用GBDT模型而言，GBDT+LR的方式将性能提升了3.4%，需要说明的是其中“LR only”方法是仅使用原有数据特征来预测CTR。
+第一种情况，当参数为$w_{0}$时，很简单：
+$$
+\frac{\partial \hat{y}(x)}{\partial w_{0}}=1.\tag{7}
+$$
+第二种情况，当参数为$w_{i}$时，显然更新$w_{i}$只跟和它相关的$x_{i}$有关：
+$$
+\frac{\partial \hat{y}(x)}{\partial w_{i}}=x_{i}.\tag{8}
+$$
+第三种情况，当参数为$v_{i,f}$时，因为我们所求的是模型对具体的某一个$i$和具体的某一个$f$对应的向量$v_{i,f}$产生的梯度，那么对于公式6中，第二项大括号外面的$\sum_{f=1}^{k}$其实是失效的，第二项大括号里面的第二小项$\sum_{i}^{n}$也是失效的，即：
+$$
+\begin{align}
+\frac{\partial \hat{y}(x)}{\partial v_{i,f}}
+&=\frac{\partial \frac{1}{2}\left(\left(\sum_{i=1}^{n}v_{i,f}x_{i}\right)^{2}-v_{i,f}^{2}x_{i}^{2}\right)}{\partial v_{i,f}}\\
+&=\frac{1}{2}\left(2x_{i}\sum_{i=1}^{n}v_{i,f}x_{i}-2v_{i,f}x_{i}^{2}\right)\\
+&=x_{i}\sum_{j=1}^{n}v_{j,f}x_{j}-v_{i,f}x_{i}^{2}
+.\tag{9}
+\end{align}
+$$
+总结来说，FM模型对参数的梯度为：
+$$
+\begin{equation}
+  \frac{\partial \hat{y}(x)}{\partial \theta}=\begin{cases}
+    1 ,& \text{if $\theta$ is $w_{0}$} \\
+	x_{i}, &\text{if $\theta$ is $w_{i}$} \\
+    x_{i}\sum_{j=1}^{n}v_{j,f}x_{j}-v_{i,f}x_{i}^{2} .& \text{if $\theta$ is $v_{i,f}$}
+  \end{cases}\tag{10}
+\end{equation}
+$$
 
-<img src="result1.png" alt="avatar" style="zoom:75%;" />
+# 2 FM算法tensorflow实践
 
-## 在线学习
+因为刚好要学习一下tensorflow，在这一小节中，我使用tensorflow来实现一下FM算法。其实相比于使用纯python实现，使用tensorflow不需要自己计算对每个参数的导数，框架本身在更新的时候会自动计算每个参数的梯度，这也是使用tensorflow方便的地方。
 
-这篇论文的后续部分讨论了很多有关在线学习（online learning）的东西，因为这个模型会部署在实际的互联网环境中，每天会遇到很多新的数据，而这些新数据会不断的改变训练样本的数据分布，进而影响模型的性能。
+在这一小节里，为方便起见，我们利用sklearn中自带的数据集，来实现针对回归任务FM算法，后续有机会再实现分类任务，我感觉分类任务其实就是加上一个softmax函数。其中FM算法代码如下，读者可以根据实际问题进行功能扩展：
 
-<img src="result2.png" alt="avatar" style="zoom:75%;" />
+```python
+# -*- coding: utf-8 -*-
+"""
+Created on Tue May 26 19:18:32 2020
+A simple implementation of Factorization Machines for regression problem
+@author: an
+"""
+import tensorflow as tf
+import os
 
-为了探究新数据对模型性能的影响，论文利用某一天的数据进行训练，并观察模型在接下来连续几天的表现，其结果如上图所示。从图中结果可以发现，在不更新模型的前提下，随着新数据的进入，模型的性能逐渐下降。GBDT+LR和仅使用GBDT这两种模型的性能在一周之后大概都下降了1%。
+class FM: 
+    def __init__(self, x, y, learning_rate = 1e-6, batch_size = 16, epoch = 100):
+        self.x = x
+        self.y = y
+        self.sam_num = x.shape[0]
+        self.fea_num = x.shape[1]
+        self.learning_rate = learning_rate
+        self.epoch = epoch
+        # the size of the vector V
+        self.inner_size = self.fea_num // 2
+        
+        if batch_size <= self.sam_num:
+            self.batch_size = batch_size
+        else:
+            # modify the batch size according to the times between batch_size and sam_num
+            self.batch_size = max(2, batch_size // -(-batch_size//self.sam_num))
+            
+    def fit(self):
+        x_input = tf.placeholder(tf.float32, shape=[None, self.fea_num], name = "x_input")
+        y_input = tf.placeholder(tf.float32, shape=[None], name="y_input")
+        biases = tf.Variable(tf.zeros([1]), name="biases")
+        linear_weights = tf.Variable(tf.random_uniform(shape=[self.fea_num, 1], minval = -1, maxval = 1),name="linear_weights")
+        second_order_weights = tf.Variable(tf.random_uniform(shape=[self.fea_num, self.inner_size], minval = -1, maxval = 1), name="second_order_weights")
+        
+        part1 = biases
+        part2 = tf.reduce_mean(tf.matmul(x_input, linear_weights),0)
+        part3 = 0.5 * tf.reduce_sum(tf.square(tf.matmul(x_input, second_order_weights)) -  tf.matmul(tf.square(x_input), tf.square(second_order_weights)), 1)
+        y_predicted = tf.add(tf.add(part1, part2), part3)
+        loss = tf.reduce_mean(tf.square(y_predicted - y_input), 0)
+        optimizer = tf.train.AdamOptimizer(learning_rate = self.learning_rate)
+        train_op = optimizer.minimize(loss)
+        
+        saver = tf.train.Saver(max_to_keep = 1)
+        tf.add_to_collection('y_p', y_predicted)
+        with tf.Session() as sess:
+            sess.run(tf.global_variables_initializer())
+            for i in range(self.epoch):
+                for batch_x, batch_y in self._batch():
+                    sess.run(train_op, feed_dict = {x_input:batch_x, y_input:batch_y})
+                if i % 100 == 0:
+                    train_loss = sess.run(loss, feed_dict = {x_input: self.x, y_input: self.y})
+                    print("epoch" + str(i) + "_loss: ", int(train_loss))
+                    saver.save(sess, "models/")
+            sess.close()
 
-为了保持模型的性能，我们需要对模型进行实时更新。当遇到数百万的数据时，单机往往需要花费1天或者更多的时间来训练GBDT，因此，作者表明可以采取替代方案，也就是每天或者每隔几天训练GBDT，但是LR却可以通过随机梯度下降做到实时更新。
+    def predict(self, x_test):
+        if not os.path.exists("models/"):
+            print("Please train the model before test!")
+            return
+        
+        with tf.Session() as sess:
+            saver = tf.train.import_meta_graph('models/.meta')
+            saver.restore(sess, tf.train.latest_checkpoint("models/"))
+            y_ = tf.get_collection('y_p')
+            print(sess.run(y_, feed_dict = {"x_input:0": x_test}))
 
-<img src="framework.png" alt="avatar" style="zoom:75%;" />
+    def _batch(self):
+        for i in range(0, self.sam_num, self.batch_size):
+            upper_bound = min(i + self.batch_size, self.sam_num)
+            batch_x = self.x[i:upper_bound]
+            batch_y = self.y[i:upper_bound]
+            yield batch_x, batch_y            
+    
+```
 
-如上图所示的模型架构中，“Online Joiner”负责收集用户点击的实时信息，将收集到的数据传给“Trainer”模块，“Trainer”根据新数据训练将训练的models传给“Ranker”，“Ranker”负责给用户投递广告。还需要说明的是，因为系统只能收到用户的点击信息，对于如何认定用户没有点击广告，可以通过调整系统的等待时间来做到，比如用户没有在固定的一段时间内点击该广告，系统便认为用户没有点击，当然这个等待时间需要根据实际情况来调节。
+在这里我对每个函数做下解释：
 
-论文还提到可以添加一个异常检测机制来得到比较稳定的模型，比如当有机器人恶意点击时，会产生大量虚假的数据进而使得数据集分布短时间内产生急剧变化，这个时候可以切断“Online Joiner”和“Trainer”的联系，来保证模型的稳定。
+1. **\__init\__**：初始化FM模型的参数，并且保证batch_size不会超过样本数量。
+2. **fit**：按照设定的epoch进行模型训练，并在最后保存模型。
+3. **predict**：加载之前的模型，并实现预测功能。
+4. **\_batch**：将训练数据按照batch_size大小，划分成不同的批次。
 
-## 论文的其他部分
+经过1000个epoch的训练，模型在全体训练集上的MSE损失变化如下：
 
-论文的第五章讨论了GBDT的规模对模型性能的影响，毕竟GBDT决策树越多的话，样本走一遍的时间会加长，导致模型预测时间变长。论文在所用的数据集上发现GBDT决策树棵数为500棵时，模型性能是最优的。作者还将GBDT所用到的特征划分为历史特征（historical features）、上下文特征（contextual features）两类，即一类是关于用户历史点击率的特征，另一类是用户所在环境的特征，作者通过实验探究了这两类特征对模型的重要性。
+```python
+epoch0_loss:  184874288
+epoch100_loss:  6064232
+epoch200_loss:  1544176
+epoch300_loss:  209665
+epoch400_loss:  13575
+epoch500_loss:  2663
+epoch600_loss:  541
+epoch700_loss:  132
+epoch800_loss:  103
+epoch900_loss:  64
+```
 
-论文的第六章讨论了应对海量数据的处理方法。比如使用均匀下采样（Uniform subsampling）的方式减少模型的训练量，使用负采样（Negative down sampling）的方法平衡训练数据集类别分布（当然这之后需要校正得到真正的CTR预测值）。
+刚开始很大是因为模型初始化之后，对每个数据几乎预测都是10000左右，而真实目标值在5-50之间，因此损失很大，但随着训练的进行，训练损失在不断的减小。在写tensorflow的时候要注意的地方还是挺多的，模型的保存和加载就是一个需要关注的点。
 
-## 小结
+完整代码以及本文的pdf版本放在了我的github里，欢迎来看！
 
-GBDT+LR确实提供了一个构造特征的新思路，因为单独使用LR模型的话，往往需要人为构造很多特征，这就要对数据集十分了解。但是GBDT+LR具体的使用效果，还是需要后续遇到业务问题时亲身实践才知道，具体情况还是会不一样的。
+# 参考
+
+1. [Factorization Machines](analyticsconsultores.com.mx/wp-content/uploads/2019/03/Factorization-Machines-Steffen-Rendle-Osaka-University-2010.pdf)
+2. [推荐系统系列（一）：FM理论与实践](https://zhuanlan.zhihu.com/p/89639306)
+3. [推荐系统召回四模型之：全能的FM模型](https://zhuanlan.zhihu.com/p/58160982)
