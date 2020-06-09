@@ -1,193 +1,218 @@
-# 因子分解机（FM）简介及实践
+学习FM算法之前，作为小白，在面对一堆带有FM名字的算法时总是一脸茫然，FFM（Field-aware Factorization Machines）就是其中让我头疼的一个。但是静下心来，认真学习FFM之后，反而觉得并不是想像中的那么晦涩难懂。这篇文章就记录一下我对FFM算法的理解，但是个人水平十分有限，有不对的地方，还请大家指出，不胜感激！
 
-因子分解机（Factorization Machines, FM）是一个在2010年被提出的算法，是预估CTR的经典模型之一。在这篇文章里，前半部分会介绍FM的原理，后半部分会通过tensorflow来实现FM算法。由于个人水平十分有限，文章中对算法理解不当的地方，烦请大家指出，不胜感激！
-
-# 1 FM简介
+# 1 FFM简介
 
 ## 1.1 提出的动机
 
-我们知道逻辑回归方法是对所有特征的一个线性加权组合，其预测值可以写为如下形式：
+通过上一篇文章（[因子分解机（FM）简介及实践](https://zhuanlan.zhihu.com/p/144346116)），我们了解到FM通过两个向量对原始的二阶特征组合权重矩阵$w_{i,j}$进行分解，进而缓解了稀疏数据对权重更新的影响，如公式1所示：
 $$
-\hat{y}(x):=w_{0}+\sum_{i=1}^{n}w_{i}x_{i}.\tag{1}
+\hat{y}(x):=w_{0}+\sum_{i=1}^{n}w_{i}x_{i}+\sum_{i=1}^{n}\sum_{j=i+1}^{n}<v_{i},v_{j}>x_{i}x_{j}.\tag{1}
 $$
-但这样的形式只是单独考虑了每个特征对目标值$y$的影响，而没有考虑特征之间的关系，比如二阶组合特征$x_{i}\cdot x_{j}$或者三阶组合特征$x_{i}\cdot x_{j}\cdot x_{k}$对目标值的影响。现在我们只考虑二阶特征组合的情况，那么逻辑回归表达式可以改写为：
-$$
-\hat{y}(x):=w_{0}+\sum_{i=1}^{n}w_{i}x_{i}+\sum_{i=1}^{n}\sum_{j=i+1}^{n}w_{i,j}x_{i}x_{j}.\tag{2}
-$$
-写成公式2的形式确实是考虑了二阶特征组合对模型预测的影响，但同时会带来一个新的问题。因为在CTR预估问题里面，或者很多分类、回归问题里面，我们常常需要对类别型特征进行one-hot编码（比如男性、女性分别被编码为01,10），当类别型特征变量较多的情况下，编码后其实是会产生了高维特征，这导致我们很难找到一组$x_{i}$和$x_{j}$使得$x_{i}\cdot x_{j}$不为0。而对于大多数$x_{i}x_{j}$乘积为0的项，对应的$w_{ij}$在梯度更新时$\frac{\partial {\hat{y}(x)}}{\partial w_{i,j}}=x_{i}x_{j}=0$，也就无法进行梯度更新来求解$w_{ij}$。
 
-而因子分解机的工作就是将$w_{i,j}$替换为两个向量的乘积$v_{i}v_{j}$，进而缓解了稀疏特征对模型求解的困难。
+假设现有一组人工构造的CTR数据，其大致格式如下图所示，其中“+”代表该广告在展示过程中被点击的次数，“-”代表没有被点击的次数，“Publisher”列代表的是发放广告的平台，而“Advertiser”列代表的是不同的广告主。
+
+<img src="sample.png" alt="avatar" style="zoom:75%;" />
+
+那么对于一条数据：
+
+<img src="instance.png" alt="avatar" style="zoom:75%;" />
+
+FM算法在进行预测时，它的二阶项可以表示为：
+$$
+w_{ESPN}\cdot w_{Nike}+w_{ESPN}\cdot w_{Male}+w_{Nike}\cdot w_{Male} \tag{2}
+$$
+从中可以看出，每项特征都通过一个隐向量来与其他特征的隐向量进行组合，进而实现特征与特征之间的组合关系。以ESPN为例，在组合另外两个特征时均以相同的一个权重$w_{ESPN}$与其他两个特征的权重$w_{Nike}$和$w_{Male}$进行组合。这里需要说明一点的是，因为"Publisher"特征中包含三个取值，即“ESPN”、“Vogue”和“NBC”，在实际做的时候会通过one-hot编码将类别变量“Publisher”编码出一个3维的特征向量，特征向量中的每一维对应一个特征的具体取值，即使用三个类别中的哪一个。因此，在公式2中，出现的是$w_{ESPN}$而不是$w_{Publisher}$。
+
+FM算法实际上是并没有考虑到每个特征所属类别这一信息的，它会使用相同的一个隐向量$w_{ESPN}$来计算$w_{ESPN}\cdot w_{Nike}$和$w_{ESPN}\cdot w_{Male}$，而特征"Nike"和“Male”原本是属于两类特征的，即“Advertiser”类和“Gender”类。
+
+那么倘若我们使用两种不同的$w_{ESPN,A}$和$w_{ESPN,G}$分别用来与$w_{Nike}$和$w_{Male}$进行计算，那么结果显然是不会比原先使用统一的$w_{ESPN}$要差的。因为使用统一的$w_{ESPN}$只是使用不同的$w_{ESPN}$的一项特例，比如我们可以令$w_{ESPN,A}=w_{ESPN,G}=w_{ESPN}$。
 
 ## 1.2 具体内容
 
-仅考虑二阶特征组合的话，FM模型表达式可以写为：
+FFM便是在FM的基础之上，加上了每个特征所属领域对模型的影响，其表达式可以写为公式3的形式：
 $$
-\hat{y}(x):=w_{0}+\sum_{i=1}^{n}w_{i}x_{i}+\sum_{i=1}^{n}\sum_{j=i+1}^{n}<\textbf{v}_{i},\textbf{v}_{j}>x_{i}x_{j}.\tag{3}
+\hat{y}(x)=w_{0}+\sum_{i=1}^{n}w_{i}x_{i}+\sum_{j_{1}=1}^{n}\sum_{j_{2}=j_{1}+1}^{n}(w_{j_{1},f_{2}}\cdot w_{j_{2},f_{1}})x_{j_{1}}x_{j_{2}},\tag{3}
 $$
-其中$<\textbf{v}_{i},\textbf{v}_{j}>$是$k$维向量$\textbf{v}_{i}$和$\textbf{v}_{j}$的点积，也是对应一个实数值：
-$$
-<\textbf{v}_{i},\textbf{v}_{j}>:=\sum_{f=1}^{k}v_{i,f}\cdot v_{j,f}.\tag{4}
-$$
-由矩阵分解可知，对任意一个正定矩阵$\textbf{W}$，都可以找到一个矩阵$\textbf{V}$，且在矩阵$\textbf{V}$维度$k$足够大的情况下使得$\textbf{W}=\textbf{V}\cdot \textbf{V}^{t}$成立。FM这样写法的精妙之处在于，首先通过矩阵分解用两个向量$\textbf{v}_{i}$和$\textbf{v}_{j}$的乘积近似原先矩阵$\textbf{W}$，这保持了变化前后的统一。其次，在拆解为$\textbf{v}_{i}$和$\textbf{v}_{j}$之后，参数更新时是对这两个向量分别更新的，那么在更新时，对于向量$\textbf{v}_{i}$，我们不需要寻找到一组$x_{i}$和$x_{j}$同时不为0，我们只需要在$x_{i}\neq 0$的情况下，找到任意一个样本$x_{k}\neq 0$即可通过$x_{i}x_{k}$来更新$\textbf{v}_{i}$，也就是说，原先更新参数$w_{i,j}$的条件对于稀疏数据比较苛刻，FM这样的写法缓解了稀疏数据造成无法更新参数的困难。
+其中$f_{1}$和$f_{2}$分别代表的是特征$j_{1}$和$j_{2}$所属的领域。也就是说原先只有一个$w_{j_{1}}$来应对其他所有的特征，而现在是有多个$w_{j_{1},f}$来应对不同领域的特征，假设领域一共有$f$个，那么原先只有1个参数，现在变为了$f-1$个。根据上一篇介绍FM算法的文章，我们知道FM算法的时间复杂度是$O(kn)$，$k$代表隐向量维度，$n$代表特征个数，那么由此可知FFM算法的时间复杂度便是$O(knf)$。当领域种类$f=1$时，即所有特征都属于同一个类别，那么FFM算法会退化为FM算法，而当领域数目$f=n$时，就是每个特征都属于不同的类别，那么FFM算法的时间复杂度会增加到$O(kn^{2})$。
 
-其实我觉得FM算法的核心思想写到这里就介绍完了，因子分解机中的“因子分解”部分就是替换原先的$w_{i,j}$。而在FM论文里，作者更进一步，将公式3改写，降低FM算法的时间复杂度。对于公式3，我们知道二阶项有两次循环，而$<\textbf{v}_{i},\textbf{v}_{j}>$又是经过$k$次计算，因此其时间复杂度为$O(kn^{2})$，但通过如下的转换过程，可以将时间复杂度降低为$O(kn)$：
+那么在更新FFM模型时，对于常数项有：
+$$
+\frac{\partial \hat{y}(x)}{\partial w_{0}}=1. \tag{4}
+$$
+对于一阶项有：
+$$
+\frac{\partial \hat{y}(x)}{\partial w_{i}}=x_{i}.\tag{5}
+$$
+而对于二阶项的更新，我们先通过一个例子来说明，对于下面的一条数据，一共有3个特征类别，8个特征以及1个label：
+
+<table>
+   <tr>
+      <td></td>
+      <td colspan="3">Publisher(1)</td>
+      <td colspan="3">Advertiser(2)</td>
+	  <td colspan="3">Gender(3)</td>
+   </tr>
+   <tr>
+      <td>label</td>
+      <td>1</td>
+      <td>2</td>
+      <td>3</td>
+      <td>4</td>
+      <td>5</td>
+      <td>6</td>
+      <td>7</td>
+      <td>8</td>
+   </tr> 
+    <tr>
+      <td>Clicked</td>
+      <td>ESPN</td>
+      <td>Vogue</td>
+      <td>NBC</td>
+      <td>Nike</td>
+      <td>Gucci</td>
+      <td>Adidas</td>
+      <td>Male</td>
+      <td>Female</td>
+   </tr>   
+   <tr>
+      <td>Yes</td>
+      <td>1</td>
+      <td>0</td>
+      <td>0</td>
+      <td>1</td>
+      <td>0</td>
+      <td>0</td>
+      <td>1</td>
+      <td>0</td>
+   </tr>
+</table>
+
+
+   那么，二阶项可以写为：
 $$
 \begin{align}
-\sum_{i=1}^{n}\sum_{j=i+1}^{n}<\textbf{v}_{i},\textbf{v}_{j}>x_{i}x_{j}
-&=\frac{1}{2}\left(\sum_{i=1}^{n}\sum_{j=1}^{n}<\textbf{v}_{i},\textbf{v}_{j}>x_{i}x_{j}-\sum_{i=1}^{n}<\textbf{v}_{i},\textbf{v}_{i}>x_{i}x_{i}\right)\\
-&=\frac{1}{2}\left(\sum_{i=1}^{n}\sum_{j=1}^{n}\sum_{f=1}^{k}v_{i,f}v_{j,f}x_{i}x_{j}-\sum_{i=1}^{n}\sum_{f=1}^{k}v_{i,f}v_{i,f}x_{i}x_{i}\right)\\
-&=\frac{1}{2}\sum_{f=1}^{k}\left(\left(\sum_{i=1}^{n}v_{i,f}x_{i}\right)\left(\sum_{j=1}^{n}v_{j,f}x_{j}\right)-\sum_{i=1}^{n}v_{i,f}^{2}x_{i}^{2}\right)\\
-&=\frac{1}{2}\sum_{f=1}^{k}\left(\left(\sum_{i=1}^{n}v_{i,f}x_{i}\right)^{2}-\sum_{i=1}^{n}v_{i,f}^{2}x_{i}^{2}\right).
-\end{align}\tag{5}
+w_{1,2}\cdot w_{4,1}x_{1}x_{4}+w_{1,2}\cdot w_{5,1}x_{1}x_{5}+w_{1,2}\cdot w_{6,1}x_{1}x_{6}+w_{1,3}\cdot w_{7,1}x_{1}x_{7}+w_{1,3}\cdot w_{8,1}x_{1}x_{8}\\
++w_{4,3}\cdot w_{7,2}x_{4}x_{7}+w_{4,3}\cdot w_{8,2}x_{4}x_{8}
+\end{align}\tag{3}
 $$
-需要解释一下的是公式5的第1步，原始求解的就是矩阵上三角之和，那么第1步就是整个矩阵之和减去矩阵的迹，然后求一半。对于稀疏数据中$x_{i}$大多数都为0，假设$\overline{m}_{D}$代表的是对于所有数据$\textbf{x}$特征不为0个数的平均值，那么FM算法复杂度实际上为$O(k\overline{m}_{D})$。
-
-那么二阶FM表达式可以写为：
+其中$w_{1,2}$中的1代表的是第1个特征ESPN，2代表的是第2个类别Advertiser，以此类推其他项。那么对于$w_{1,2}$的更新，我们可以写为：
 $$
-\hat{y}(x):=w_{0}+\sum_{i=1}^{n}w_{i}x_{i}+\frac{1}{2}\sum_{f=1}^{k}\left(\left(\sum_{i=1}^{n}v_{i,f}x_{i}\right)^{2}-\sum_{i=1}^{n}v_{i,f}^{2}x_{i}^{2}\right).\tag{6}
+\frac{\partial \hat{y}(x)}{\partial w_{1,2}}=w_{4,1}x_{1}x_{4}+w_{5,1}x_{1}x_{5}+w_{6,1}x_{1}x_{6}. \tag{6}
 $$
-
-
-接下来我们根据公式6计算一下FM算法更新时的梯度。
-
-第一种情况，当参数为$w_{0}$时，很简单：
+因此可以得到二阶项的梯度更新公式：
 $$
-\frac{\partial \hat{y}(x)}{\partial w_{0}}=1.\tag{7}
+\frac{\partial \hat{y}(x)}{\partial w_{j_{1},f_{2}}}=\sum_{j_{2}\in f_{2}}w_{j_{2},f_{1}}x_{j_{1}}x_{j_{2}}.\tag{7}
 $$
-第二种情况，当参数为$w_{i}$时，显然更新$w_{i}$只跟和它相关的$x_{i}$有关：
+当然公式6和公式7都可以再进一步简化，因为在同一个类别中，只有一个特征值为1，其余都是0。比如公式6可以写为：
 $$
-\frac{\partial \hat{y}(x)}{\partial w_{i}}=x_{i}.\tag{8}
+\frac{\partial \hat{y}(x)}{\partial w_{1,2}}=w_{4,1}x_{1}x_{4}. \tag{8}
 $$
-第三种情况，当参数为$v_{i,f}$时，因为我们所求的是模型对具体的某一个$i$和具体的某一个$f$对应的向量$v_{i,f}$产生的梯度，那么对于公式6中，第二项大括号外面的$\sum_{f=1}^{k}$其实是失效的，第二项大括号里面的第二小项$\sum_{i}^{n}$也是失效的，即：
+那么公式7就会变为：
 $$
-\begin{align}
-\frac{\partial \hat{y}(x)}{\partial v_{i,f}}
-&=\frac{\partial \frac{1}{2}\left(\left(\sum_{i=1}^{n}v_{i,f}x_{i}\right)^{2}-v_{i,f}^{2}x_{i}^{2}\right)}{\partial v_{i,f}}\\
-&=\frac{1}{2}\left(2x_{i}\sum_{i=1}^{n}v_{i,f}x_{i}-2v_{i,f}x_{i}^{2}\right)\\
-&=x_{i}\sum_{j=1}^{n}v_{j,f}x_{j}-v_{i,f}x_{i}^{2}
-.\tag{9}
-\end{align}
-$$
-总结来说，FM模型对参数的梯度为：
-$$
-\begin{equation}
-  \frac{\partial \hat{y}(x)}{\partial \theta}=\begin{cases}
-    1 ,& \text{if $\theta$ is $w_{0}$} \\
-	x_{i}, &\text{if $\theta$ is $w_{i}$} \\
-    x_{i}\sum_{j=1}^{n}v_{j,f}x_{j}-v_{i,f}x_{i}^{2} .& \text{if $\theta$ is $v_{i,f}$}
-  \end{cases}\tag{10}
-\end{equation}
+\frac{\partial \hat{y}(x)}{\partial w_{j_{1},f_{2}}}=w_{j_{2},f_{1}}x_{j_{1}}x_{j_{2}},j_{2}\in f_{2}\ \text{and}\ x_{j_{2}}\neq0. \tag{9}
 $$
 
-# 2 FM算法tensorflow实践
+# 2 FFM算法tensorflow实践
 
-因为刚好要学习一下tensorflow，在这一小节中，我使用tensorflow来实现一下FM算法。其实相比于使用纯python实现，使用tensorflow不需要自己计算对每个参数的导数，框架本身在更新的时候会自动计算每个参数的梯度，这也是使用tensorflow方便的地方。
+在这一部分中，我使用tensorflow来实现一下FFM算法，但是这里的实现仅仅是为了理解算法流程而做的一个小例子，相比于FFM作者提供的开源包肯定是有很多不完备的地方的。
 
-在这一小节里，为方便起见，我们利用sklearn中自带的数据集，来实现针对回归任务FM算法，后续有机会再实现分类任务，我感觉分类任务其实就是加上一个softmax函数。其中FM算法代码如下，读者可以根据实际问题进行功能扩展：
+## 2.1 数据集介绍及预处理
+
+因为FFM算法是专门考虑了特征所属领域对模型预测的影响，因此如果仍旧使用以往没有特征类别的数据集，我感觉是无法体会到FFM算法的作用的。所以在这里采用Avazu提供的Kaggle比赛数据集（下载地址：[Click-Through Rate Prediction](https://www.kaggle.com/c/avazu-ctr-prediction/data)），由于原始训练数据集规模较大（解压后5.87GB），所以在这里我们只采用前500条数据（大小为77KB）作为示范，这个小数据集可以在我的github上找到，当然最后模型训练的结果是无法与FFM作者在这一比赛中的优异表现所能对比的。
+
+在原始数据集上，除去类标click（0代表用户没点击，1代表用户点击了）之外，一共有23个特征，包括用户id、网站类别、用户设备等等。在这里我们随机选取了11个特征进行后续处理，因为如果对23个特征均进行one-hot编码的话，特征维度会比较大，代码在我这台破电脑上运行速度会非常慢（当然也可能是我代码写的不够高效）。
+
+经过one-hot编码，11个类别总共产生66个特征，每个类别包含的特征数目分别对应如下：
+
+| 特征类别         | 特征数量 |
+| ---------------- | -------- |
+| C1               | 3        |
+| banner_pos       | 2        |
+| site_category    | 8        |
+| app_domain       | 7        |
+| app_category     | 6        |
+| device_id        | 24       |
+| device_type      | 3        |
+| device_conn_type | 3        |
+| C15              | 3        |
+| C16              | 3        |
+| C18              | 4        |
+
+## 2.2 FFM算法核心代码
+
+这里实现的FFM算法和原始FFM论文有略微的差别，即原始FFM算法论文的损失是对数指数损失，而在这里我采用的是交叉熵损失。当然，我这里的实现也加上了正则化项。
+
+略有不足的地方是在于计算FFM特征组合时，使用了两层的for循环，这样下来，FFM程序运行是比较慢的。因为原始论文并没有化简公式3，不像FM运行那么快捷。
+
+需要提一点的是，训练数据x里面是带有每列的列名的，函数 **self._get_field​**是用来计算当前的列属于哪一类特征。
 
 ```python
-# -*- coding: utf-8 -*-
-"""
-Created on Tue May 26 19:18:32 2020
-A simple implementation of Factorization Machines for regression problem
-@author: an
-"""
-import tensorflow as tf
-import os
-
-class FM: 
-    def __init__(self, x, y, learning_rate = 1e-6, batch_size = 16, epoch = 100):
-        self.x = x
-        self.y = y
-        self.sam_num = x.shape[0]
-        self.fea_num = x.shape[1]
-        self.learning_rate = learning_rate
-        self.epoch = epoch
-        # the size of the vector V
-        self.inner_size = self.fea_num // 2
-        
-        if batch_size <= self.sam_num:
-            self.batch_size = batch_size
-        else:
-            # modify the batch size according to the times between batch_size and sam_num
-            self.batch_size = max(2, batch_size // -(-batch_size//self.sam_num))
-            
+class FFM:
+    def __init__(self, x, y, field_name, lbd = 0.01, learning_rate = 2e-3, batch_size = 16, epoch = 50):
+        #篇幅原因，这里省略，详见Github
+    
     def fit(self):
-        x_input = tf.placeholder(tf.float32, shape=[None, self.fea_num], name = "x_input")
-        y_input = tf.placeholder(tf.float32, shape=[None], name="y_input")
-        biases = tf.Variable(tf.zeros([1]), name="biases")
-        linear_weights = tf.Variable(tf.random_uniform(shape=[self.fea_num, 1], minval = -1, maxval = 1),name="linear_weights")
-        second_order_weights = tf.Variable(tf.random_uniform(shape=[self.fea_num, self.inner_size], minval = -1, maxval = 1), name="second_order_weights")
-        
+        x_input = tf.placeholder(dtype = tf.float32, shape = [None, self.fea_num], name = "x_input")
+        y_input = tf.placeholder(dtype = tf.float32, shape = [None, 1], name = "y_input")
+#        print(x_input[:,1])
+        biases = tf.Variable(tf.random_normal(shape = [1], mean = 0, stddev = 1), name = 'biases')
+        linear_w = tf.Variable(tf.random_normal(shape = [self.fea_num, 1], mean = 0, stddev = 1), name = "linear_weights")
+        complex_w = tf.Variable(tf.random_normal(shape = [self.fea_num, self.fie_num, self.k], mean = 0, stddev = 1), name = "complex_weights")
         part1 = biases
-        part2 = tf.reduce_mean(tf.matmul(x_input, linear_weights),0)
-        part3 = 0.5 * tf.reduce_sum(tf.square(tf.matmul(x_input, second_order_weights)) -  tf.matmul(tf.square(x_input), tf.square(second_order_weights)), 1)
+        part2 = tf.matmul(x_input, linear_w)
+        # first method to calculate the part3
+        part3 = tf.Variable(tf.random_normal(shape = [1], mean = 0, stddev = 1), name = 'biases')
+        for i in range(self.fea_num - 1):
+            f1 = self._get_field(i)
+            for j in range(i+1, self.fea_num):
+                f2 = self._get_field(j)
+                part3 += tf.reduce_sum(tf.multiply(complex_w[i][f2], complex_w[j][f1])) * tf.multiply(x_input[:,i],x_input[:,j])
+        part3 = tf.reshape(part3,[-1, 1])
         y_predicted = tf.add(tf.add(part1, part2), part3)
-        loss = tf.reduce_mean(tf.square(y_predicted - y_input), 0)
+        y_predicted2 = tf.nn.sigmoid(y_predicted)
+        loss1 = tf.reduce_sum(tf.nn.sigmoid_cross_entropy_with_logits(labels = y_input, logits = y_predicted))
+        loss2 = tf.nn.l2_loss(complex_w)
+        loss = loss1 + self.lbd * loss2
         optimizer = tf.train.AdamOptimizer(learning_rate = self.learning_rate)
         train_op = optimizer.minimize(loss)
         
         saver = tf.train.Saver(max_to_keep = 1)
-        tf.add_to_collection('y_p', y_predicted)
+        tf.add_to_collection('y_p', y_predicted2)
         with tf.Session() as sess:
             sess.run(tf.global_variables_initializer())
             for i in range(self.epoch):
                 for batch_x, batch_y in self._batch():
                     sess.run(train_op, feed_dict = {x_input:batch_x, y_input:batch_y})
-                if i % 100 == 0:
+                if i % 50 == 0:
                     train_loss = sess.run(loss, feed_dict = {x_input: self.x, y_input: self.y})
                     print("epoch" + str(i) + "_loss: ", int(train_loss))
-                    saver.save(sess, "models/")
+                    saver.save(sess, "models/m")
             sess.close()
-
-    def predict(self, x_test):
-        if not os.path.exists("models/"):
-            print("Please train the model before test!")
-            return
         
-        with tf.Session() as sess:
-            saver = tf.train.import_meta_graph('models/.meta')
-            saver.restore(sess, tf.train.latest_checkpoint("models/"))
-            y_ = tf.get_collection('y_p')
-            print(sess.run(y_, feed_dict = {"x_input:0": x_test}))
-
+    def predict(self, x_test):
+        #篇幅原因，这里省略，详见Github
+    def score(self, x_test, y_test):
+        #篇幅原因，这里省略，详见Github
     def _batch(self):
-        for i in range(0, self.sam_num, self.batch_size):
-            upper_bound = min(i + self.batch_size, self.sam_num)
-            batch_x = self.x[i:upper_bound]
-            batch_y = self.y[i:upper_bound]
-            yield batch_x, batch_y            
-    
+        #篇幅原因，这里省略，详见Github
+            
+    def _get_field(self, i):
+        cur = self.x.columns[i]
+        for index, element in enumerate(self.field_name):
+            if len(cur) > len(element) and cur[:len(element)] == element and cur[len(element)] == "_":
+                return index
 ```
 
-在这里我对每个函数做下解释：
-
-1. **\__init\__**：初始化FM模型的参数，并且保证batch_size不会超过样本数量。
-2. **fit**：按照设定的epoch进行模型训练，并在最后保存模型。
-3. **predict**：加载之前的模型，并实现预测功能。
-4. **\_batch**：将训练数据按照batch_size大小，划分成不同的批次。
-
-经过1000个epoch的训练，模型在全体训练集上的MSE损失变化如下：
+训练过程中产生的loss变化如下
 
 ```python
-epoch0_loss:  184874288
-epoch100_loss:  6064232
-epoch200_loss:  1544176
-epoch300_loss:  209665
-epoch400_loss:  13575
-epoch500_loss:  2663
-epoch600_loss:  541
-epoch700_loss:  132
-epoch800_loss:  103
-epoch900_loss:  64
+epoch0_loss:  494
+epoch50_loss:  54
+epoch100_loss:  50
+epoch150_loss:  50
+epoch200_loss:  49
+epoch250_loss:  49
+epoch300_loss:  49
 ```
 
-刚开始很大是因为模型初始化之后，对每个数据几乎预测都是10000左右，而真实目标值在5-50之间，因此损失很大，但随着训练的进行，训练损失在不断的减小。在写tensorflow的时候要注意的地方还是挺多的，模型的保存和加载就是一个需要关注的点。
-
-完整代码以及本文的pdf版本放在了我的github里，欢迎来看！
-
-# 参考
-
-1. [Factorization Machines](analyticsconsultores.com.mx/wp-content/uploads/2019/03/Factorization-Machines-Steffen-Rendle-Osaka-University-2010.pdf)
-2. [推荐系统系列（一）：FM理论与实践](https://zhuanlan.zhihu.com/p/89639306)
-3. [推荐系统召回四模型之：全能的FM模型](https://zhuanlan.zhihu.com/p/58160982)
+最后模型在测试集上的准确率为0.65，对于二分类问题来说效果不是很好，这可能因为我们训练的样本数特别少，而且特征是随机选择的。当然我写代码主要是理解一下FFM模型的训练过程，也就不继续深究模型性能如何提升了。^_^
